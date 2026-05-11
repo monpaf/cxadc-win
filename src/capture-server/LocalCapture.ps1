@@ -86,6 +86,21 @@
     Convert the audio data to a 2-channel FLAC file (L+R) and a 1-channel u8 file (HSW).
     Without conversion the output file is 3-channel s24le.
 
+.PARAMETER AudioDevice
+    Capture an external DirectShow audio device with FFmpeg.
+
+.PARAMETER AudioRate
+    Set the external audio capture sample rate. (DEFAULT: 48000)
+
+.PARAMETER AudioChannels
+    Set the external audio capture channel count. (DEFAULT: 2)
+
+.PARAMETER AudioCompressionLevel
+    Set the external audio FLAC compression level. (DEFAULT: 5)
+
+.PARAMETER ListAudioDevices
+    List DirectShow audio capture devices with FFmpeg and exit.
+
 .PARAMETER FlacThreadCount
     Set the number of threads each "flac.exe" instance can use. (DEFAULT: 4)
 
@@ -139,10 +154,23 @@
 
     Files
     TestCapture-video.flac
+
+.EXAMPLE
+    PS> .\LocalCapture.ps1 -Name TestCapture -Video 0 -CompressVideo -VideoBaseRate 28636 -AudioDevice "Microphone (MicNode_Stereo)"
+
+    - Video data is captured from \\.\cxadc0 using a sample rate of 28636 and saved as FLAC
+    - External USB audio is captured from a DirectShow audio device and saved as FLAC
+
+    Files
+    TestCapture-video.flac
+    TestCapture-audio.flac
+
 #>
 
 #Requires -Version 7.4
 #Requires -PSEdition Core
+
+[CmdletBinding()]
 
 param(
     [string] $Name,
@@ -166,6 +194,12 @@ param(
     [int] $BasebandRate = 48000,
     [switch] $ConvertBaseband = $false,
     [switch] $CompressHeadSwitch = $true,
+
+    [string] $AudioDevice,
+    [int] $AudioRate = 48000,
+    [int] $AudioChannels = 2,
+    [ValidateRange(0, 12)][int] $AudioCompressionLevel = 5,
+    [switch] $ListAudioDevices = $false,
 
     [int] $FlacThreadCount = 4,
     [int] $FFmpegThreadCount = 4,
@@ -440,6 +474,156 @@ Class CxCaptureServer {
     }
 }
 
+$FindBinary = {
+    param([string] $Name)
+
+    $FileName = ($Name + ".exe")
+    $ScriptPath = (Join-Path -Path $PSScriptRoot -ChildPath $FileName)
+
+    # check .\
+    if ((Test-Path -Path $FileName) -eq $true) {
+        return (Get-Item -Path $FileName).FullName
+    }
+
+    # check script path
+    if ((Test-Path -Path $ScriptPath) -eq $true) {
+        return $ScriptPath
+    }
+
+    # check $PATH
+    $GCResult = (Get-Command -Name $FileName -ErrorAction SilentlyContinue)
+
+    if ($GCResult -ne $null) {
+        return $GCResult.Path
+    }
+
+    throw ($Name + " not found in path")
+}
+
+function Start-DirectShowAudioCapture {
+    param(
+        [ValidateNotNullOrEmpty()][EscapedPath] $FFmpeg,
+        [ValidateNotNullOrEmpty()][string] $Device,
+        [ValidateNotNullOrEmpty()][int] $Rate,
+        [ValidateNotNullOrEmpty()][int] $Channels,
+        [ValidateNotNullOrEmpty()][int] $CompressionLevel,
+        [ValidateNotNullOrEmpty()][string] $OutputFile
+    )
+
+    $ProcessStartInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $ProcessStartInfo.FileName = $FFmpeg.Path
+    $ProcessStartInfo.WorkingDirectory = (Get-Location).Path
+    $ProcessStartInfo.UseShellExecute = $false
+    $ProcessStartInfo.RedirectStandardInput = $true
+
+    $Arguments = @(
+        "-hide_banner",
+        "-y",
+        "-f", "dshow",
+        "-thread_queue_size", 1024,
+        "-sample_rate", $Rate,
+        "-channels", $Channels,
+        "-i", ("audio=" + $Device),
+        "-ac", $Channels,
+        "-ar", $Rate,
+        "-c:a", "flac",
+        "-compression_level", $CompressionLevel,
+        $OutputFile
+    )
+
+    ForEach ($Argument in $Arguments) {
+        $null = $ProcessStartInfo.ArgumentList.Add([string] $Argument)
+    }
+
+    $Process = [System.Diagnostics.Process]::Start($ProcessStartInfo)
+    Start-Sleep -Milliseconds 500
+
+    if ($Process.HasExited) {
+        throw ("external audio capture stopped immediately with exit code " + $Process.ExitCode)
+    }
+
+    return $Process
+}
+
+function Stop-DirectShowAudioCapture {
+    param(
+        [System.Diagnostics.Process] $Process
+    )
+
+    if ($Process -eq $null) {
+        return
+    }
+
+    if (!$Process.HasExited) {
+        Write-Host "Stopping external audio capture..."
+
+        try {
+            $Process.StandardInput.WriteLine("q")
+            $Process.StandardInput.Flush()
+        }
+        catch {
+            Write-Warning ("unable to stop external audio capture cleanly: " + $_)
+        }
+
+        if (!$Process.WaitForExit(5000)) {
+            Write-Warning "external audio capture did not stop cleanly after 5 seconds, killing it"
+            $Process.Kill($true)
+            $Process.WaitForExit()
+        }
+    }
+
+    if ($Process.ExitCode -ne 0) {
+        Write-Warning ("external audio capture exited with code " + $Process.ExitCode)
+    }
+}
+
+function Show-DirectShowAudioDevices {
+    param(
+        [ValidateNotNullOrEmpty()][string] $FFmpegPath
+    )
+
+    $FFmpegOutput = & $FFmpegPath -hide_banner -list_devices true -f dshow -i dummy 2>&1 | ForEach-Object { $_.ToString() }
+    $AudioDevices = @()
+    $CurrentDevice = $null
+
+    ForEach ($Line in $FFmpegOutput) {
+        if ($Line -match '\]\s+"(.+)" \(audio\)') {
+            $CurrentDevice = [PSCustomObject]@{
+                Name = $Matches[1]
+                AlternativeName = $null
+            }
+            $AudioDevices += $CurrentDevice
+            continue
+        }
+
+        if (($CurrentDevice -ne $null) -and ($Line -match '\]\s+Alternative name "(.+)"')) {
+            $CurrentDevice.AlternativeName = $Matches[1]
+        }
+    }
+
+    if ($AudioDevices.Count -eq 0) {
+        Write-Warning "No DirectShow audio devices found."
+        return
+    }
+
+    ForEach ($Device in $AudioDevices) {
+        Write-Host $Device.Name
+        if (![string]::IsNullOrWhiteSpace($Device.AlternativeName)) {
+            Write-Verbose ("Alternative name: " + $Device.AlternativeName)
+        }
+    }
+}
+
+if ($ListAudioDevices) {
+    try {
+        Show-DirectShowAudioDevices -FFmpegPath $FindBinary.Invoke("ffmpeg")
+    } catch {
+        Write-Error $_
+    }
+
+    exit
+}
+
 if (!$PSBoundParameters.ContainsKey("Name")) {
     Write-Error "no name provided"
     exit
@@ -500,35 +684,20 @@ if ($Baseband) {
     }
 }
 
+$ExternalAudioOutputFile = $null
+$ExternalAudioProcess = $null
+
+if ($PSBoundParameters.ContainsKey("AudioDevice")) {
+    if ([string]::IsNullOrWhiteSpace($AudioDevice)) {
+        Write-Error "audio device cannot be empty"
+        exit
+    }
+    $ExternalAudioOutputFile = ($BasePath + "-audio.flac")
+}
+
 if ($Devices.Count -eq 0) {
     Write-Error "No devices selected"
     exit
-}
-
-$FindBinary = {
-    param([string] $Name)
-
-    $FileName = ($Name + ".exe")
-    $ScriptPath = (Join-Path -Path $PSScriptRoot -ChildPath $FileName)
-
-    # check .\
-    if ((Test-Path -Path $FileName) -eq $true) {
-        return (Get-Item -Path $FileName).FullName
-    }
-
-    # check script path
-    if ((Test-Path -Path $ScriptPath) -eq $true) {
-        return $ScriptPath
-    }
-
-    # check $PATH
-    $GCResult = (Get-Command -Name $FileName -ErrorAction SilentlyContinue)
-
-    if ($GCResult -ne $null) {
-        return $GCResult.Path
-    }
-
-    throw ($Name + " not found in path")
 }
 
 # check path for binaries
@@ -546,7 +715,7 @@ try {
         $BinaryPaths.Sox = [EscapedPath]::new($FindBinary.Invoke("sox"))
     }
 
-    if ($Baseband -or (($ResampleVideo -or $ResampleHifi) -and !$UseSox)) {
+    if ($Baseband -or $PSBoundParameters.ContainsKey("AudioDevice") -or (($ResampleVideo -or $ResampleHifi) -and !$UseSox)) {
         $BinaryPaths.FFmpeg = [EscapedPath]::new($FindBinary.Invoke("ffmpeg"))
     }
 } catch {
@@ -572,6 +741,13 @@ try {
         return
     }
     
+    if ($ExternalAudioOutputFile -ne $null) {
+        Write-Host ("Starting external audio capture from `"" + $AudioDevice + "`"")
+        $ExternalAudioProcess = Start-DirectShowAudioCapture `
+            -FFmpeg $BinaryPaths.FFmpeg -Device $AudioDevice -Rate $AudioRate `
+            -Channels $AudioChannels -CompressionLevel $AudioCompressionLevel -OutputFile $ExternalAudioOutputFile
+    }
+
     ForEach ($Device in $Devices) {
         if ($Device -is [CxDeviceData]) {
             $CxCaptureServer.CaptureCx($Device)
@@ -700,7 +876,12 @@ finally {
     Write-Host "Waiting for writes to finish..."
     
     try {
-        $Overflows = $CxCaptureServer.StopCapture()
+        try {
+            $Overflows = $CxCaptureServer.StopCapture()
+        }
+        finally {
+            Stop-DirectShowAudioCapture -Process $ExternalAudioProcess
+        }
 
         if ($Overflows -gt 0) {
             Write-Warning "capture stopped with " + $Overflows + " overflows"
@@ -715,6 +896,10 @@ finally {
         ForEach ($OutputFile in $Device.OutputFiles) {
             Write-Host ("  " + $OutputFile)
         }
+    }
+
+    if ($ExternalAudioOutputFile -ne $null) {
+        Write-Host ("  " + $ExternalAudioOutputFile)
     }
 
     Write-Host "Killing server"

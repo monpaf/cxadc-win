@@ -249,6 +249,35 @@ PS> .\LocalCapture.ps1 -Name TestCapture `
   ```
 </details>
 
+#### Example: Single card + external USB audio
+```
+PS> .\LocalCapture.ps1 -Name TestCapture `
+                       -Video 0 -CompressVideo -VideoBaseRate 28636 `
+                       -AudioDevice "Microphone (MicNode_Stereo)"
+```
+
+<details>
+  <summary>Details</summary>
+
+  - Video data is captured from `\\.\cxadc0` using a sample rate of `28636` and saved as FLAC
+  - External audio is captured from a DirectShow audio device and saved as FLAC
+  - Use `-ListAudioDevices` to show the available DirectShow audio device names
+</details>
+
+<details>
+  <summary>Output files</summary>
+
+  ```
+  TestCapture-video.flac
+  TestCapture-audio.flac
+  ```
+</details>
+
+#### Example: List external audio devices
+```
+PS> .\LocalCapture.ps1 -ListAudioDevices
+```
+
 #### Example: Single card + clockgen audio
 ```
 PS> .\LocalCapture.ps1 -Name TestCapture `
